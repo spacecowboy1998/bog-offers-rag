@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from neo4j import Driver
 from openai import OpenAI
@@ -14,21 +14,12 @@ class RetrievedOffer:
     category: str
     short_desc: str
     cities: str
-    brands: str
+    long_desc: str
+    brand_name: str
     segment_types: str
     product_codes: str
     score: float
-    matched_query: str
     is_relaxed: bool
-
-
-def _format_list_prop(val: Any) -> str:
-    """Helper to safely convert Neo4j lists to a string."""
-    if val is None:
-        return ""
-    if isinstance(val, list):
-        return ", ".join(str(v) for v in val)
-    return str(val).strip()
 
 
 def retrieve_candidates_graph(
@@ -39,115 +30,117 @@ def retrieve_candidates_graph(
         embedding_model: str,
         index_name: str,
         query: str,
-        top_k: int,
-        city: Optional[str],
-        categories: List[str],
-        segment_types: List[str],
-        product_codes: List[str],
+        top_k: int = 15,
+        cities: List[str] = None,
+        categories: List[str] = None,
+        segment_types: List[str] = None,
+        product_codes: List[str] = None,
 ) -> List[RetrievedOffer]:
 
-    # 1. Embed the query
+    # 1. Generate Vector
     emb = openai_client.embeddings.create(model=embedding_model, input=[query])
     vector = emb.data[0].embedding
 
-    # 2. Smart Weighted Cypher Query
+    # 2. Graph-Guarded Cypher Query
     cypher = """
-    CALL db.index.vector.queryNodes($indexName, 50, $vector)
+    // A. Vector Search
+    CALL db.index.vector.queryNodes($indexName, 100, $vector)
     YIELD node AS o, score AS vectorScore
 
-    // Check City Match (Weight: 2.5)
-    OPTIONAL MATCH (o)-[:IN_CITY]->(c:City)
-    WITH o, vectorScore, c,
-         CASE WHEN ($city IS NOT NULL AND toLower(c.name) CONTAINS toLower($city)) THEN 1 ELSE 0 END AS cityMatch
 
-    // Check Category Match (Weight: 1.5)
-    OPTIONAL MATCH (o)-[:IN_CATEGORY]->(cat:Category)
-    WITH o, vectorScore, c, cityMatch, cat,
-         CASE WHEN ($categories IS NOT NULL AND cat.name IN $categories) THEN 1 ELSE 0 END AS catMatch
+    // Conditional Hard Filter: City
+    MATCH (o)-[:IN_CITY]->(c:City)
+    WITH o, vectorScore, collect(c.name) as offerCities
+    WHERE 
+        size($cities) = 0 
+        OR 
+        any(city IN $cities WHERE city IN offerCities)
 
-    // Check Brand Match (Weight: 2.0)
-    OPTIONAL MATCH (o)-[:HAS_BRAND]->(b:Brand)
-    WITH o, vectorScore, c, cityMatch, cat, catMatch, b,
-         CASE WHEN toLower($query) CONTAINS toLower(b.name) THEN 1 ELSE 0 END AS brandMatch
-
-    // Check Segment Match (Weight: 1.0)
+    // Conditional Hard Filter: Segments
     OPTIONAL MATCH (o)-[:REQUIRES_SEGMENT]->(s:SegmentType)
-    WITH o, vectorScore, c, cityMatch, cat, catMatch, b, brandMatch, s,
-         CASE WHEN ($segmentTypes IS NOT NULL AND s.code IN $segmentTypes) THEN 1 ELSE 0 END AS segMatch
+    WITH o, vectorScore, offerCities, collect(s.code) as segments
+    WHERE 
+        size($segmentTypes) = 0 
+        OR 
+        any(seg IN segments WHERE seg IN $segmentTypes)
+    
+    // Conditional Hard Filter: Products (UPDATED)
+    OPTIONAL MATCH (o)-[:REQUIRES_PRODUCT]->(p:ProductCode)
+    WITH o, vectorScore, offerCities, segments, collect(p.code) as products
+    WHERE 
+        size($productCodes) = 0 
+        OR 
+        any(prod IN products WHERE prod IN $productCodes)
 
+    //  Fetch Products (For context/display)
+    OPTIONAL MATCH (o)-[:REQUIRES_PRODUCT]->(p:ProductCode)
+    WITH o, vectorScore, offerCities, segments, collect(p.code) as products
 
-    WITH o, vectorScore, c, cat, b, s, cityMatch, catMatch, brandMatch, segMatch,
-         (vectorScore 
-          + (cityMatch * 2.5) 
-          + (brandMatch * 2.0) 
-          + (catMatch * 1.5) 
-          + (segMatch * 1.0)) AS finalScore
-
-    // Aggregation (Deduplicate rows)
-    WITH o, max(finalScore) AS score, 
-         max(cityMatch) AS cityHit,      
-         max(catMatch) AS catHit,        
-         collect(distinct c.name) AS relCities
-
-    // It is "Relaxed" (Alternative) ONLY if a specific requested constraint FAILED.
-    WITH o, score, relCities,
+    //  Soft Filter: Category (Boost Score)
+    OPTIONAL MATCH (o)-[:IN_CATEGORY]->(cat:Category)
+    WITH o, vectorScore, offerCities, segments, products, cat,
          CASE 
-           // User asked for City, but we found 0 matches for it
-           WHEN ($city IS NOT NULL AND cityHit = 0) THEN true
-           
-           // User asked for Category, but we found 0 matches for it
-           WHEN ($categories IS NOT NULL AND size($categories) > 0 AND catHit = 0) THEN true
-           
-           // Otherwise, it is a valid match
-           ELSE false 
-         END AS isRelaxed
+            WHEN size($categories) > 0 AND cat.name IN $categories THEN 1.0 
+            ELSE 0.0 
+         END AS catBoost
+    
+    // Get Brand for context
+    OPTIONAL MATCH (o)-[:HAS_BRAND]->(b:Brand)
+
+    //Final Scoring
+    WITH o, offerCities, segments, products, b, cat, 
+         (vectorScore + (catBoost * 0.1)) as finalScore,
+         (size($categories) > 0 AND catBoost = 0) as isRelaxed
 
     RETURN
       o.campaignId AS campaignId,
       o.title AS title,
       o.categoryDesc AS categoryDesc,
       o.shortDesc AS shortDesc,
-      o.cityNames AS cityNames,
-      o.brandNames AS brandNames,
-      o.segmentTypesFlat AS segmentTypesFlat,
-      o.productCodesFlat AS productCodesFlat,
-      score,
+      o.longDesc AS longDesc,
+      offerCities AS cityNames,
+      segments AS segmentTypes,
+      products AS productCodes,
+      b.name AS brandName,
+      finalScore AS score,
       isRelaxed
 
-    ORDER BY score DESC
-    LIMIT $topK
+    ORDER BY finalScore DESC
+    LIMIT toInteger($topK)
     """
 
     params = {
         "indexName": index_name,
         "vector": vector,
         "topK": top_k,
-        "query": query,
-        "city": city,
-        "categories": categories,
-        "segmentTypes": segment_types,
-        "productCodes": product_codes
+        "cities": cities or [],
+        "categories": categories or [],
+        "segmentTypes": segment_types or [],
+        "productCodes": product_codes or []
     }
 
-    out: List[RetrievedOffer] = []
+    results: List[RetrievedOffer] = []
 
     with driver.session(database=database) as session:
-        res = session.run(cypher, params)
-        for r in res:
-            out.append(
-                RetrievedOffer(
-                    campaign_id=int(r["campaignId"]),
-                    title=str(r["title"] or "").strip(),
-                    category=str(r["categoryDesc"] or "").strip(),
-                    short_desc=str(r["shortDesc"] or "").strip(),
-                    cities=_format_list_prop(r["cityNames"]),
-                    brands=_format_list_prop(r["brandNames"]),
-                    segment_types=_format_list_prop(r["segmentTypesFlat"]),
-                    product_codes=_format_list_prop(r["productCodesFlat"]),
-                    score=float(r["score"]),
-                    matched_query=query,
-                    is_relaxed=bool(r["isRelaxed"])
-                )
-            )
+        rows = session.run(cypher, params)
+        for r in rows:
+            # Safe string formatting for lists
+            city_str = ", ".join(r["cityNames"]) if r["cityNames"] else "All Cities"
+            seg_str = ", ".join(r["segmentTypes"]) if r["segmentTypes"] else ""
+            prod_str = ", ".join(r["productCodes"]) if r["productCodes"] else ""
 
-    return out
+            results.append(RetrievedOffer(
+                campaign_id=r["campaignId"],
+                title=r["title"],
+                category=r["categoryDesc"],
+                short_desc=r["shortDesc"],
+                long_desc=r["longDesc"],
+                cities=city_str,
+                brand_name=r["brandName"] or "",
+                segment_types=seg_str,
+                product_codes=prod_str,
+                score=r["score"],
+                is_relaxed=r["isRelaxed"]
+            ))
+
+    return results
