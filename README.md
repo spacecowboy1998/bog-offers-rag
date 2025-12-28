@@ -1,95 +1,110 @@
+
 # Bank of Georgia Offers GraphRAG
 
-**An intelligent Graph-based Retrieval-Augmented Generation (RAG) engine that integrates a Neo4j Property Graph with Vector Embeddings to provide high-precision financial offer discovery.**
+**An intelligent Schema-Driven Graph RAG engine that combines Neo4j Knowledge Graphs with Vector Embeddings to provide high-precision, compliant financial offer recommendations.**
 
-## Project Status
+Unlike standard RAG, which relies solely on semantic similarity ("vibe matching"), this system uses a **Graph-Guarded Retrieval** strategy. It enforces strict business logic (Location, Expiry, Eligibility) while leveraging LLMs for natural language understanding and persuasive communication.
 
-The core engine is fully functional. The system currently supports automated ETL from the Bank of Georgia API, Neo4j graph construction with vector indexing, and an agentic RAG search pipeline.
+---
 
-## Project Screenshots
+## 🚀 How It Works (The 3-Step Pipeline)
 
-## Installation and Setup Instructions
+The system transforms unstructured user queries into structured graph operations through a three-stage pipeline:
 
-**Prerequisites:** You will need Python 3.10+, a Neo4j instance (local or AuraDB), and an OpenAI API Key.
+### **Step 1: Intelligent Data Ingestion (ETL)**
+We do not scrape HTML. We reverse-engineered the internal API to fetch raw JSON data, ensuring reliability.
+* **Action:** Fetches offers from `bankofgeorgia.ge`, cleans HTML tags, parses dates, and normalizes metadata.
+* **Graph Construction:** Creates a Neo4j Knowledge Graph where `Offers` are nodes connected to `City`, `Category`, `Brand`, and `Segment` entities.
+* **Vectorization:** Generates semantic embeddings using `text-embedding-3-large` on a rich text block (Title + Brand + Long Description).
 
-### Clone the Repository
+### **Step 2: Schema-Driven Intent Planning**
+We replaced fragile "prompt engineering" with **Pydantic Structured Outputs**.
+* **Action:** When a user asks *"I need a hotel in Batumi for a food tour,"* the Planner forces the LLM to output a strict Python object:
+    ```python
+    SearchPlan(
+        cities=["Batumi"],
+        categories=["Food", "Travel"],
+        rewritten_queries=["Best restaurants Batumi", "Hotels in Batumi"]
+    )
+    ```
+* **Benefit:** This guarantees type safety and eliminates hallucinations (e.g., inventing cities that don't exist in our database).
 
-```bash
-git clone https://github.com/yourusername/bog-offers-rag.git
-cd bog-offers-rag
+### **Step 3: Graph-Guarded Hybrid Retrieval**
+We execute a **Hybrid Search** that combines the speed of vectors with the accuracy of graphs.
+* **Vector Search:** Finds the top 100 offers semantically related to "food tour".
+* **Graph Filter (The Guard):** Applies strict Cypher constraints:
+    * `WHERE o.endDate >= date()` (No expired offers)
+    * `MATCH (o)-[:IN_CITY]->({name: 'Batumi'})` (Strict location filtering)
+* **Result:** The system physically excludes irrelevant offers (e.g., a sushi place in Tbilisi) regardless of how high their vector score is.
+
+---
+
+## 🛠️ Project Structure
+
+```text
+bog-offers-rag/
+├── data/                   # Local storage for raw/processed JSON
+├── scripts/                # Execution entry points
+│   ├── fetch_offers.py     # Step 1: API Extraction & Cleaning
+│   ├── neo4j_ops.py        # Step 1: Graph Building & Indexing
+│   └── search_cli.py       # The Main Application (Planner -> Retrieve -> Chat)
+├── src/
+│   ├── data_collection/    # Pydantic models for data validation
+│   ├── kg/                 # Graph Builders, Batch Ingestion, and Indexing
+│   ├── rag/                # The Brain:
+│   │   ├── planner.py      # Pydantic Router (User Intent -> Schema)
+│   │   ├── retrieve.py     # Graph-Guarded Search (Cypher + Vectors)
+│   │   ├── merge.py        # Deduplication & Re-ranking Logic
+│   │   └── composer.py     # Consultant Agent (Generates "Why" explanations)
+└── .env                    # Secrets configuration
 
 ```
 
-### Setup Steps
+---
 
-1. **Install Dependencies:**
+## 💻 Installation & Setup
+
+**Prerequisites:** Python 3.10+, Neo4j (Local or AuraDB), OpenAI API Key.
+
+### 1. Clone & Install
+
 ```bash
+git clone [https://github.com/yourusername/bog-offers-rag.git](https://github.com/yourusername/bog-offers-rag.git)
+cd bog-offers-rag
 pip install -r requirements.txt
 
 ```
 
+### 2. Configure Environment
 
-2. **Configure Environment:**
-Create a `.env` file in the root directory with the following keys:
+Create a `.env` file in the root directory:
+
 ```ini
-OPENAI_API_KEY=your_key
+OPENAI_API_KEY=your_key_here
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your_password
-NEO4J_DATABASE=neo4j
 EMBEDDING_MODEL=text-embedding-3-large
-CHAT_MODEL=gpt-4o-mini
+CHAT_MODEL=gpt-4o
 
 ```
 
+### 3. Build the Brain (Run Once)
 
-3. **Ingest Data & Build Graph:**
+This fetches live data, processes it, and constructs the Knowledge Graph.
+
 ```bash
+# Fetch fresh data from Bank of Georgia
 python -m scripts.fetch_offers
+
+# Build Graph & Vector Indexes
 python -m scripts.neo4j_ops
 
 ```
 
+### 4. Run the Concierge
 
-4. **Start Search CLI:**
+Start the interactive chat session.
+
 ```bash
 python -m scripts.search_cli
-
-```
-
-
-
----
-
-## Reflection
-
-### Context
-
-This project was built as a high-fidelity implementation of **Hybrid GraphRAG** designed to handle complex relational data within a banking ecosystem. The goal was to move beyond basic vector search and incorporate structured business logic—such as cities, brands, and eligibility segments—directly into the retrieval process.
-
-### The Build
-
-I set out to build an engine that could intelligently handle the "Zero Result" problem. By utilizing **Soft Filtering** and **Weighted Scoring**, the system ensures that if an exact match (e.g., "Sushi in Batumi") doesn't exist, it can provide semantically similar alternatives while explicitly labeling them as recommendations rather than search failures.
-
- $Score = \text{VectorScore} + (2.5 \times \text{CityMatch}) + (2.0 \times \text{BrandMatch}) + (1.5 \times \text{CategoryMatch})$
----
-
-## Project Structure
-
-```text
-bog-offers-rag/
-├── data/                   # JSON storage for raw and processed offer data
-├── scripts/                # Execution entry points
-│   ├── fetch_offers.py     # ETL: Fetch from API -> Process -> Save JSON
-│   ├── neo4j_ops.py        # ETL: Ingest JSON -> Neo4j Graph + Embeddings
-│   └── search_cli.py       # RAG: Interactive CLI for testing queries
-├── src/
-│   ├── data_collection/    # API Client and Pydantic validation models
-│   ├── kg/                 # Graph Builders, Batch Ingestion, and Indexing
-│   ├── rag/                # RAG Logic (Planner, Weighted Retrieve, Composer)
-│   └── Utils/              # Environment and credential helpers
-├── .env                    # Local environment secrets
-├── .gitignore              # Project-specific git exclusion rules
-└── requirements.txt        # Pinned project dependencies
-
-```
