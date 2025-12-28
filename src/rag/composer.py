@@ -41,7 +41,7 @@ INSTRUCTIONS:
 5. STRUCTURE:
    - Start with Exact Matches (isRelaxed = false) with high energy.
    - Mention Alternatives (isRelaxed = true) gently: "You might also be interested in..."
-   - MUST MENTION ALL OFFERS: Do not skip any. Do not summarize.
+   - MUST MENTION ALL OFFERS Provided: Do not skip any. Do not summarize.
 
 6. FORMATTING (CRITICAL):
    - Write in natural, conversational Georgian.
