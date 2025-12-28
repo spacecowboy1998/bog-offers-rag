@@ -9,7 +9,7 @@ from Utils.helper import get_openai_api_key
 from src.kg.neo4j_client import get_neo4j_database, get_neo4j_driver
 
 
-def _as_list(value: Any) -> List[str]:
+def _as_list(value: Any):
     if value is None:
         return []
     if isinstance(value, list):
@@ -20,34 +20,36 @@ def _as_list(value: Any) -> List[str]:
     return [str(value).strip()]
 
 
-def _build_doc_text(offer: Dict[str, Any]) -> str:
+def _build_doc_text(offer: Dict[str, Any]):
+    """
+    Builds semantically dense text for embedding.
+    Combines Title + Brand + Short Desc + Long Desc.
+    """
     title = offer.get("title", "") or ""
-    category = offer.get("categoryDesc", "") or ""
 
-    cities = offer.get("cityNames", [])
-    if isinstance(cities, str):
-        cities = [cities]
-
+    # Brands are critical keywords
     brands = offer.get("brandNames", [])
     if isinstance(brands, str):
         brands = [brands]
 
-    short_desc = offer.get("shortDesc", "") or ""
+    # Clean and retrieve descriptions
+    short_desc = (offer.get("shortDesc") or "").strip()
+    long_desc = (offer.get("longDesc") or "").strip()
+
+    full_description = f"{short_desc}\n{long_desc}"
 
     return (
-        f"Offer:{title}\n"
-        f"Category:{category}\n"
-        f"Location:{', '.join(cities)}\n"
-        f"Brand:{', '.join(brands)}\n"
-        f"Details\n"
-        f"{short_desc}"
+        f"Offer: {title}\n"
+        f"Brand: {', '.join(brands)}\n"
+        f"Details: {full_description[:1000]}"
     ).strip()
 
 
-def _load_processed_offers(project_root: Path) -> List[Dict[str, Any]]:
+def _load_processed_offers(project_root) :
     stamp = date.today().isoformat()
     path = project_root / "data" / "processed" / f"offers_{stamp}.json"
     if not path.exists():
+        # Fallback to try finding ANY file if today's doesn't exist (optional)
         raise FileNotFoundError(f"Processed offers not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -93,35 +95,39 @@ def build_graph_with_embeddings():
       o.shortDesc = $shortDesc,
       o.longDesc = $longDesc,
       o.benefText = $benefText,
-      o.cityNames = $cityNames,
-      o.brandNames = $brandNames,
+      o.startDate = $startDate, 
+      o.endDate = $endDate,      
+      o.cityNames = $cityNamesFlat,
+      o.brandNames = $brandNamesFlat,
       o.segmentTypesFlat = $segmentTypesFlat,
       o.productCodesFlat = $productCodesFlat,
+      
       o.embedding = $embedding
 
     WITH o
 
-    FOREACH (city IN $cityNames |
+    // Iterate over LISTS to create relationships
+    FOREACH (city IN $cityNamesList |
       MERGE (c:City {name: city})
       MERGE (o)-[:IN_CITY]->(c)
     )
 
-    FOREACH (cat IN $categories |
+    FOREACH (cat IN $categoriesList |
       MERGE (k:Category {name: cat})
       MERGE (o)-[:IN_CATEGORY]->(k)
     )
 
-    FOREACH (b IN $brandNames |
+    FOREACH (b IN $brandNamesList |
       MERGE (br:Brand {name: b})
       MERGE (o)-[:HAS_BRAND]->(br)
     )
 
-    FOREACH (st IN $segmentTypes |
+    FOREACH (st IN $segmentTypesList |
       MERGE (s:SegmentType {code: st})
       MERGE (o)-[:REQUIRES_SEGMENT]->(s)
     )
 
-    FOREACH (pc IN $productCodes |
+    FOREACH (pc IN $productCodesList |
       MERGE (p:ProductCode {code: pc})
       MERGE (o)-[:REQUIRES_PRODUCT]->(p)
     )
@@ -141,14 +147,13 @@ def build_graph_with_embeddings():
                 for item, vec in zip(chunk, vectors):
                     offer = item["offer"]
 
-                    city_names = _as_list(offer.get("cityNames"))
-                    brand_names = _as_list(offer.get("brandNames"))
-                    segment_types = _as_list(offer.get("segmentTypes"))
-                    product_codes = _as_list(offer.get("productCodes"))
+                    city_list = _as_list(offer.get("cityNames"))
+                    brand_list = _as_list(offer.get("brandNames"))
+                    segment_list = _as_list(offer.get("segmentTypes"))
+                    product_list = _as_list(offer.get("productCodes"))
 
-                    # Category is a single string in your data; keep it as list for FOREACH
                     category_desc = (offer.get("categoryDesc") or "").strip()
-                    categories = [category_desc] if category_desc else []
+                    category_list = [category_desc] if category_desc else []
 
                     tx.run(
                         cypher,
@@ -159,14 +164,20 @@ def build_graph_with_embeddings():
                             "shortDesc": offer.get("shortDesc") or "",
                             "longDesc": (offer.get("longDesc") or "")[:600],
                             "benefText": offer.get("benefText") or "",
-                            "segmentTypesFlat": ", ".join(segment_types),
-                            "productCodesFlat": ", ".join(product_codes),
-                            "cityNames": ", ".join(city_names),
-                            "brandNames": ", ".join(brand_names),
-                            "segmentTypes": segment_types,
-                            "productCodes": product_codes,
-                            "categories": categories,
+                            "startDate": offer.get("startDate"),
+                            "endDate": offer.get("endDate"),
+                            "segmentTypesFlat": ", ".join(segment_list),
+                            "productCodesFlat": ", ".join(product_list),
+                            "cityNamesFlat": ", ".join(city_list),
+                            "brandNamesFlat": ", ".join(brand_list),
                             "embedding": vec,
+
+                            # Lists for relationships
+                            "cityNamesList": city_list,
+                            "brandNamesList": brand_list,
+                            "segmentTypesList": segment_list,
+                            "productCodesList": product_list,
+                            "categoriesList": category_list,
                         },
                     )
 
